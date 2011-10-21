@@ -1,9 +1,8 @@
 /* mtp.h - MTP2 and MTP3 functionality.
  *
- * Copyright (C) 2005-2006, Sifira A/S.
+ * Copyright (C) 2005-2011 Netfors ApS.
  *
  * Author: Kristian Nielsen <kn@sifira.dk>
- *         Anders Baekgaard <ab@sifira.dk>
  *         Anders Baekgaard <ab@netfors.com>
  *
  * This file is part of chan_ss7.
@@ -42,8 +41,8 @@ void mtp3_put_label(int sls, ss7_variant variant, int opc, int dpc, unsigned cha
 int mtp_has_inservice_schannels(struct link*);
 int mtp2_slink_inservice(int linkix);
 int cmd_mtp_linkstatus(char* buff, int details, int timeslot);
-int cmd_mtp_data(int fd, int argc, char *argv[]);
-int cmd_testfailover(int fd, int argc, char *argv[]);
+int cmd_mtp_data(int fd, int argc, argv_type argv);
+int cmd_testfailover(int fd, int argc, argv_type argv);
 
 int get_receive_pipe(void);
 void mtp_enqueue_control(struct mtp_req *req);

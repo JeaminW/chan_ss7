@@ -1,9 +1,9 @@
 /* mtp3d.c - mtp2/mtp3 daemon
+ *
+ * Copyright (C) 2006-2011 Netfors ApS.
+ *
  * Author: Anders Baekgaard <ab@netfors.com>
- * This work is derived from chan_ss7, see copyright below.
- */
-
-/*
+ *
  * This file is part of chan_ss7.
  *
  * chan_ss7 is free software; you can redistribute it and/or modify
@@ -123,6 +123,7 @@ int mtp3_connect_socket(const char* host, const char* port)
     res = socket(rp->ai_family, hints.ai_socktype, hints.ai_protocol);
     if (res == -1)
       continue;
+    ast_log(LOG_DEBUG, "connecting to mtp3d %s:%d, fd %d\n", inet_ntoa(((struct sockaddr_in*) rp)->sin_addr), ntohs(((struct sockaddr_in*) rp)->sin_port), res);
     if ((s = connect(res, rp->ai_addr, rp->ai_addrlen)) != -1)
       break;
     close(res);
@@ -182,6 +183,7 @@ int mtp3_register_isup(int s, int linkix)
   struct mtp_req* req = (struct mtp_req *)buff;
   int res;
 
+  memset(req, 0, sizeof(*req));
   req->isup.link = NULL;
   req->isup.slink = NULL;
   req->typ = MTP_REQ_REGISTER_L4;
@@ -202,6 +204,7 @@ int mtp3_register_sccp(int s, int subsystem, int linkix)
   struct mtp_req* req = (struct mtp_req *)buff;
   int res;
 
+  memset(req, 0, sizeof(*req));
   req->isup.link = NULL;
   req->isup.slink = NULL;
   req->typ = MTP_REQ_REGISTER_L4;

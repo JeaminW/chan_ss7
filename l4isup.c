@@ -1,9 +1,8 @@
 /* l4isup.c - ISUP protocol
  *
- * Copyright (C) 2006, Sifira A/S.
+ * Copyright (C) 2006-2011 Netfors ApS.
  *
- * Author: Anders Baekgaard <ab@sifira.dk>
- *         Anders Baekgaard <ab@netfors.com>
+ * Author: Anders Baekgaard <ab@netfors.com>
  * Based on work by: Kristian Nielsen <kn@sifira.dk>,
  *
  * This file is part of chan_ss7.
@@ -207,8 +206,11 @@ static int must_stop_continuity_check_thread = 0;
 
 static void isup_send_grs(struct ss7_chan *pvt, int count, int do_timers);
 
-static struct ast_channel *ss7_requester(const char *type, int format,
-                                         void *data, int *cause);
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
+static struct ast_channel *ss7_requester(const char *type, int format, void *data, int *cause);
+#else
+static struct ast_channel *ss7_requester(const char *type, format_t format, const struct ast_channel *requestor, void *data, int *cause);
+#endif
 static int ss7_send_digit_begin(struct ast_channel *chan, char digit);
 static int ss7_send_digit_end(struct ast_channel *chan, char digit, unsigned int duration);
 static int ss7_call(struct ast_channel *chan, char *addr, int timeout);
@@ -241,7 +243,7 @@ static const char tdesc[] = "SS7 Protocol Driver";
 static const struct ast_channel_tech ss7_tech = {
   .type = type,
   .description = tdesc,
-  .capabilities = AST_FORMAT_ALAW,
+  .capabilities = AST_FORMAT_ALAW | AST_FORMAT_ULAW,
   .requester = ss7_requester,
 #ifdef USE_ASTERISK_1_2
   .send_digit = ss7_send_digit_begin,
@@ -335,6 +337,24 @@ static void decr_usecount(void)
 }
 #endif
 
+static int str2redirectreason(const char *str)
+{
+  if (strcmp(str, "UNKNOWN") == 0)
+    return 0x00;
+  else if (strcmp(str, "BUSY") == 0)
+    return 0x01;
+  else if (strcmp(str, "NO_REPLY") == 0)
+    return 0x02;
+  else if (strcmp(str, "UNCONDITIONAL") == 0)
+    return 0x03;
+  else if (strcmp(str, "UNREACHABLE") == 0)
+    return 0x06;
+  else {
+    ast_log(LOG_NOTICE, "Invalid redirection reason value '%s' in PRIREDIRECTREASON variable.\n", str);
+    return 0x00;
+  }
+}
+
 static void request_hangup(struct ast_channel* chan, int hangupcause)
 {
   chan->hangupcause = hangupcause;
@@ -415,6 +435,7 @@ static void mtp_enqueue_isup_packet(struct link* link, int cic, unsigned char *m
     lsi = slink->linkset->lsi;
   else
     lsi = linkset->lsi;
+  memset(req, 0, sizeof(*req));
   req->typ = reqtyp;
   req->isup.slink = slink;
   req->isup.link = link;
@@ -425,8 +446,14 @@ static void mtp_enqueue_isup_packet(struct link* link, int cic, unsigned char *m
   if(slink && slink->mtp3fd > -1) {
     res = mtp3_send(slink->mtp3fd, (unsigned char *)req, sizeof(struct mtp_req) + req->len);
     if (res < 0) {
+      ast_log(LOG_DEBUG, "closing connection to mtp3d, fd %d, res: %d, err: %s\n", slink->mtp3fd, res, strerror(errno));
       close(slink->mtp3fd);
       slink->mtp3fd = -1;
+    }
+    {
+      struct isup_msg isup_msg;
+      res = decode_isup_msg(&isup_msg, slink->linkset->variant, msg, msglen);
+      ast_log(LOG_DEBUG, "Sent to mtp3d: %s (CIC %d), link '%s'\n", isupmsg(isup_msg.typ), cic, slink->name);
     }
     return;
   }
@@ -582,7 +609,7 @@ static struct ss7_chan *cic_hunt_odd_lru(struct linkset* linkset, int first_cic,
       return best;
     }
   }
-  ast_log(LOG_WARNING, "No idle circuit found.\n");
+  ast_log(LOG_WARNING, "No idle circuit found, linkset=%s.\n", linkset->name);
   return NULL;
 }
 
@@ -625,7 +652,7 @@ static struct ss7_chan *cic_hunt_even_mru(struct linkset* linkset, int first_cic
     best->next_idle = NULL;
     return best;
   } else {
-    ast_log(LOG_WARNING, "No idle circuit found.\n");
+    ast_log(LOG_WARNING, "No idle circuit found, linkset=%s.\n", linkset->name);
     return NULL;
   }
 }
@@ -671,16 +698,63 @@ static struct ss7_chan *cic_hunt_seq_lth_htl(struct linkset* linkset, int lth, i
     best->next_idle = NULL;
     return best;
   } else {
-    ast_log(LOG_WARNING, "No idle circuit found.\n");
+    ast_log(LOG_WARNING, "No idle circuit found, linkset=%s.\n", linkset->name);
     return NULL;
+  }
+}
+
+static void handle_redir_info(struct ast_channel *chan, struct isup_redir_info* inf)
+{
+  if(inf->is_redirect) {
+    char *string_reason;
+    char count[4];
+    char redir[4];
+    int res;
+
+    snprintf(redir, sizeof(redir), "%d", inf->is_redirect);
+    /* The names here are taken to match with those used in chan_zap.c
+       redirectingreason2str(). */
+    switch(inf->reason) {
+    case 1:
+      string_reason = "BUSY";
+      break;
+    case 2:
+      /* Cause 4 "deflection during alerting"; not sure, but it seems to be
+	 more or less equivalent to "no reply".*/
+    case 4:
+      string_reason = "NO_REPLY";
+      break;
+    case 3:
+      /* Cause 5 "deflection immediate response"; not sure, but it seems to
+	 be more or less equivalent to "unconditional".*/
+    case 5:
+      string_reason = "UNCONDITIONAL";
+      break;
+    case 6:
+      string_reason = "UNREACHABLE";
+      break;
+    default:
+      string_reason = "UNKNOWN";
+      break;
+    }
+    /* Set SS7_REDIRECTCOUNT */
+    res = snprintf(count, sizeof(count), "%d",inf->count + 1);
+    pbx_builtin_setvar_helper(chan, "__SS7_REDIRECTCOUNT", (res > 0) ? count : "1");
+    /* Use underscore variable to make it inherit like other callerid info. */
+    pbx_builtin_setvar_helper(chan, "__PRIREDIRECTREASON", string_reason);
+    pbx_builtin_setvar_helper(chan, "SS7_REDIR", redir);
   }
 }
 
 /* Send a "release" message. */
 static void isup_send_rel(struct ss7_chan *pvt, int cause) {
+  struct ast_channel *chan = pvt->owner;
+  char* redir  = chan ? (char*) pbx_builtin_getvar_helper(chan, "SS7_REDIR") : NULL;
+  char* rdni  = chan ? (char*) pbx_builtin_getvar_helper(chan, "SS7_RDNI") : NULL;
   unsigned char msg[MTP_MAX_PCK_SIZE];
   int current, varptr;
   unsigned char param[2];
+  const char *strp;
 
   isup_msg_init(msg, sizeof(msg), variant(pvt), peeropc(pvt), peerdpc(pvt), pvt->cic, ISUP_REL, &current);
   isup_msg_start_variable_part(msg, sizeof(msg), &varptr, &current, 1, 1);
@@ -688,6 +762,37 @@ static void isup_send_rel(struct ss7_chan *pvt, int cause) {
   param[1] = 0x80 | (cause & 0x7f); /* Last octet */
   isup_msg_add_variable(msg, sizeof(msg), &varptr, &current, param, 2);
   isup_msg_start_optional_part(msg, sizeof(msg), &varptr, &current);
+
+  if (redir) {
+    unsigned char param_redir[2];
+    unsigned char reason = 0x03, rcount = 1;
+
+    param_redir[0] = atoi(redir);
+    strp  = chan ? (char*) pbx_builtin_getvar_helper(chan, "PRIREDIRECTREASON") : NULL;
+    if (strp)
+      reason = str2redirectreason(strp);
+    /* Read SS7_REDIRECTCOUNT and use it to set redirection counter (see ITU-T Q.763 3.44) */
+    strp = pbx_builtin_getvar_helper(chan, "SS7_REDIRECTCOUNT");
+    if (strp) {
+      char *endptr;
+      unsigned long val = strtoul(strp, &endptr, 0);
+      if ((strp == endptr) || val < 0 || val > 7)
+        ast_log(LOG_NOTICE, "Invalid redirection count value '%ld' "
+                            "in SS7_REDRECTCOUNT variable.\n", val);
+      else
+        rcount = val;
+    }
+    param_redir[1] = ((reason & 0x0F) << 4) | (rcount & 0x07);   /* redirecting reason, counter */
+    isup_msg_add_optional(msg, sizeof(msg), &current, IP_REDIRECTION_INFORMATION,
+			  param_redir, 2);
+  }
+  if (rdni && *rdni) {
+    unsigned char param_rdni[2 + PHONENUM_MAX];
+    int res = isup_calling_party_num_encode(rdni, 0 /* no pres_restr */, 0 /* national use: user provided, not verified */, param_rdni, sizeof(param_rdni));
+    isup_msg_add_optional(msg, sizeof(msg), &current, IP_REDIRECTION_NUMBER, param_rdni, res);
+  }
+
+
   isup_msg_end_optional_part(msg, sizeof(msg), &current);
   mtp_enqueue_isup(pvt, msg, current);
 }
@@ -699,9 +804,11 @@ static void isup_send_rlc(struct ss7_chan* pvt) {
   int cic = pvt->cic;
 
   isup_msg_init(msg, sizeof(msg), variant(pvt), peeropc(pvt), peerdpc(pvt), cic, ISUP_RLC, &current);
-  isup_msg_start_variable_part(msg, sizeof(msg), &varptr, &current, 0, 1);
-  isup_msg_start_optional_part(msg, sizeof(msg), &varptr, &current);
-  isup_msg_end_optional_part(msg, sizeof(msg), &current);
+  if (variant(pvt) != ANSI_SS7) {
+    isup_msg_start_variable_part(msg, sizeof(msg), &varptr, &current, 0, 1);
+    isup_msg_start_optional_part(msg, sizeof(msg), &varptr, &current);
+    isup_msg_end_optional_part(msg, sizeof(msg), &current);
+  }
   mtp_enqueue_isup(pvt, msg, current);
 }
 
@@ -817,7 +924,7 @@ static void initiate_release_circuit(struct ss7_chan* pvt, int cause)
    Assumes called with global lock and pvt->lock held. */
 static struct ast_channel *ss7_new(struct ss7_chan *pvt, int state, char* cid_num, char* exten) {
   struct ast_channel *chan;
-
+  int format;
 #ifdef USE_ASTERISK_1_2
   chan = ast_channel_alloc(1);
   if(!chan) {
@@ -826,7 +933,11 @@ static struct ast_channel *ss7_new(struct ss7_chan *pvt, int state, char* cid_nu
   snprintf(chan->name, sizeof(chan->name), "%s/%s/%d", type, pvt->link->linkset->name, pvt->cic);
   chan->type = type;
 #else
+#if defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
   chan = ast_channel_alloc(1, state, cid_num, NULL, NULL, exten, pvt->context, 0, "%s/%s/%d", type, pvt->link->linkset->name, pvt->cic);
+#else
+  chan = ast_channel_alloc(1, state, cid_num, NULL, NULL, exten, pvt->context, NULL, 0, "%s/%s/%d", type, pvt->link->linkset->name, pvt->cic);
+#endif
   ast_jb_configure(chan, ss7_get_global_jbconf());
   if(!chan) {
     return NULL;
@@ -834,11 +945,15 @@ static struct ast_channel *ss7_new(struct ss7_chan *pvt, int state, char* cid_nu
 #endif
 
   chan->tech = &ss7_tech;
-  chan->nativeformats = AST_FORMAT_ALAW;
-  chan->rawreadformat = AST_FORMAT_ALAW;
-  chan->rawwriteformat = AST_FORMAT_ALAW;
-  chan->readformat = AST_FORMAT_ALAW;
-  chan->writeformat = AST_FORMAT_ALAW;
+  if (variant(pvt) == ANSI_SS7)
+    format = AST_FORMAT_ULAW;
+  else
+    format = AST_FORMAT_ALAW;
+  chan->nativeformats = format;
+  chan->rawreadformat = format;
+  chan->rawwriteformat = format;
+  chan->readformat = format;
+  chan->writeformat = format;
   ast_setstate(chan, state);
   chan->fds[0] = pvt->zaptel_fd;
 
@@ -887,8 +1002,12 @@ static struct ss7_chan* cic_hunt(struct linkset* linkset, int first_cic, int las
 }
 
 /* Request an SS7 channel. */
-static struct ast_channel *ss7_requester(const char *type, int format,
-                                         void *data, int *cause) {
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
+static struct ast_channel *ss7_requester(const char *type, int format, void *data, int *cause)
+#else
+static struct ast_channel *ss7_requester(const char *type, format_t format, const struct ast_channel *requestor, void *data, int *cause)
+#endif
+{
   char *arg = data;
   struct ast_channel *chan;
   struct ss7_chan *pvt;
@@ -897,11 +1016,10 @@ static struct ast_channel *ss7_requester(const char *type, int format,
   char *cic_sep = strchr(arg, ':');
   int first_cic, last_cic;
 
-  ast_log(LOG_DEBUG, "SS7 request (%s/%s) format = 0x%X.\n", type, arg, format);
+  ast_log(LOG_DEBUG, "SS7 request (%s/%s) format = 0x%llX.\n", type, arg, (long long) format);
 
-  if(!(format & AST_FORMAT_ALAW)) {
-    ast_log(LOG_NOTICE, "Audio format 0x%X not supported by SS7 channel.\n",
-            format);
+  if(!(format & (AST_FORMAT_ALAW | AST_FORMAT_ULAW))) {
+    ast_log(LOG_NOTICE, "Audio format 0x%llX not supported by SS7 channel.\n", (long long) format);
     return NULL;
   }
   if (sep) {
@@ -975,7 +1093,7 @@ static struct ast_channel *ss7_requester(const char *type, int format,
   if(pvt == NULL) {
     unlock_global();
     *cause = AST_CAUSE_CONGESTION;
-    ast_log(LOG_WARNING, "SS7 requester: No idle circuit available.\n");
+    ast_log(LOG_WARNING, "SS7 requester: No idle circuit available, linkset=%s.\n", linkset->name);
     return NULL;
   }
 
@@ -1695,6 +1813,7 @@ static void handle_complete_address(struct ss7_chan *pvt)
   ast_string_field_set(chan, language, pvt->language);
 #endif
 
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
   if(iam->ani.present) {
     chan->cid.cid_num = strdup(iam->ani.num);
     /* ToDo: Handle screening. */
@@ -1708,42 +1827,34 @@ static void handle_complete_address(struct ss7_chan *pvt)
     /* ToDo: implement redirection reason in Asterisk, and handle it here. */
     chan->cid.cid_rdnis = strdup(iam->rni.num);
   }
-  if(iam->redir_inf.is_redirect) {
-    char *string_reason;
-    /* The names here are taken to match with those used in chan_zap.c
-       redirectingreason2str(). */
-    switch(iam->redir_inf.reason) {
-    case 1:
-      string_reason = "BUSY";
-      break;
-    case 2:
-      /* Cause 4 "deflection during alerting"; not sure, but it seems to be
-	 more or less equivalent to "no reply".*/
-    case 4:
-      string_reason = "NO_REPLY";
-      break;
-    case 3:
-      /* Cause 5 "deflection immediate response"; not sure, but it seems to
-	 be more or less equivalent to "unconditional".*/
-    case 5:
-      string_reason = "UNCONDITIONAL";
-      break;
-    case 6:
-      string_reason = "UNREACHABLE";
-      break;
-    default:
-      string_reason = "UNKNOWN";
-      break;
+  chan->cid.cid_dnid = strdup(iam->dni.num);
+#else
+  if(iam->ani.present) {
+    chan->connected.id.number.str = strdup(iam->ani.num);
+    if(iam->ani.restricted) {
+      chan->connected.id.number.presentation = AST_PRES_PROHIB_NETWORK_NUMBER;
+    } else {
+      chan->connected.id.number.presentation = AST_PRES_ALLOWED_NETWORK_NUMBER;
     }
-    /* Use underscore variable to make it inherit like other callerid info. */
-    pbx_builtin_setvar_helper(chan, "__PRIREDIRECTREASON", string_reason);
   }
+  /* ToDo: Handle screening. */
+  if(iam->rni.present) {
+    /* ToDo: implement redirection reason in Asterisk, and handle it here. */
+    chan->redirecting.from.number.str = strdup(iam->rni.num);
+  }
+#endif
+  handle_redir_info(chan, &iam->redir_inf);
   if(iam->gni.ani.present)
     pbx_builtin_setvar_helper(chan, "__SS7_GENERIC_ANI", iam->gni.ani.num);
   if(iam->gni.dni.present)
     pbx_builtin_setvar_helper(chan, "__SS7_GENERIC_DNI", iam->gni.dni.num);
   if(iam->gni.rni.present)
     pbx_builtin_setvar_helper(chan, "__SS7_GENERIC_RNI", iam->gni.rni.num);
+  if (iam->trans_medium) {
+    char tmr[6];
+    snprintf(tmr, sizeof(tmr), "0x%02x", iam->trans_medium);
+    pbx_builtin_setvar_helper(chan, "__SS7_TMR", tmr);
+  }
 
   if (!pvt->link->linkset->use_connect) {
     isup_send_acm(pvt);
@@ -1997,6 +2108,7 @@ static int isup_send_iam(struct ast_channel *chan, char *addr, char *rdni, char 
   int res;
   const char *isdn_h324m;
   int h324m_usi=0, h324m_llc=0;
+  const char *strp;
 
   isdn_h324m = pbx_builtin_getvar_helper(chan, "ISDN_H324M");
   if (isdn_h324m) {
@@ -2008,8 +2120,6 @@ static int isup_send_iam(struct ast_channel *chan, char *addr, char *rdni, char 
       h324m_llc = 1;
     }
     ast_log(LOG_DEBUG, "chan_ss7: isup_send_iam: h324m_usi=%d, h324m_llc=%d\n", h324m_usi, h324m_llc);
-  } else {
-    ast_log(LOG_DEBUG, "chan_ss7: isup_send_iam: ISDN_H324M is not set.\n");
   }
 
   isup_msg_init(msg, sizeof(msg), variant(pvt), peeropc(pvt), peerdpc(pvt), pvt->cic, ISUP_IAM, &current);
@@ -2033,18 +2143,50 @@ static int isup_send_iam(struct ast_channel *chan, char *addr, char *rdni, char 
   param[0] = 0x0a; /* Ordinary calling subscriber */
   isup_msg_add_fixed(msg, sizeof(msg), &current, param, 1);
 
-  /* Transmission medium requirement Q.763 (3.54). */
-  if (h324m_usi || h324m_llc) {
-    param[0] = 0x02; /* 64 kbit/s unrestricted */
-    pvt->is_digital = 1;
-  } else {
-    param[0] = 0x00; /* Speech */
+  if (variant(pvt) == ANSI_SS7) {
+    isup_msg_start_variable_part(msg, sizeof(msg), &varptr, &current, 2, 1);
+    /* Some switches do not understand H.223. Those switches use Access Transport
+     * (Low Layer Compatibility) to signal the video call end-to-end.
+     */
+    if (h324m_usi) {
+      /* User Service Information: Q.763 3.57 */
+      param[0] = 0x88; /* unrestricted digital information */
+      param[1] = 0x90; /* circuit mode, 64 kbit */
+      param[2] = 0xA6; /* UL1, H.223 and H.245 */
+      isup_msg_add_variable(msg, sizeof(msg), &varptr, &current, param, 3);
+    }
+    else {
+      /* User Service Information. */
+      param[0] = 0x90; /* Last octet, ITU-T standardized coding */
+      param[1] = 0x90; /* Last octet, Circuit mode, 64 kbit/s */
+      param[2] = 0xa2; /* Last octet, UL1, G.711 u-law */
+      isup_msg_add_variable(msg, sizeof(msg), &varptr, &current, param, 3);
+    }
   }
-  isup_msg_add_fixed(msg, sizeof(msg), &current, param, 1);
+  else {
+    /* Transmission medium requirement Q.763 (3.54). */
+    strp = pbx_builtin_getvar_helper(chan, "SS7_TMR");
+    if (strp) {
+      /* Get transmission media value and make sure it is legal */
+      char *endptr;
+      unsigned long val = strtoul(strp, &endptr, 0);
+      if ((strp == endptr) || val < 0 || val > 255) {
+	ast_log(LOG_NOTICE, "Invalid transmedium requirement value '%ld' in SS7_TMR variable.\n", val);
+	param[0] = 0x00;
+      } else
+	param[0] = (unsigned char) val;
+    }
+    else if (h324m_usi || h324m_llc) {
+      param[0] = 0x02; /* 64 kbit/s unrestricted */
+      pvt->is_digital = 1;
+    } else {
+      param[0] = 0x00; /* Speech */
+    }
+    isup_msg_add_fixed(msg, sizeof(msg), &current, param, 1);
+    isup_msg_start_variable_part(msg, sizeof(msg), &varptr, &current, 1, 1);
+  }
 
   /* Called party number Q.763 (3.9). */
-  isup_msg_start_variable_part(msg, sizeof(msg), &varptr, &current, 1, 1);
-
   if (dnilimit > 0 && strlen(dni) > dnilimit) {
     /* Make part of dni */
     strncpy(dnicpy, dni, dnilimit);
@@ -2065,12 +2207,21 @@ static int isup_send_iam(struct ast_channel *chan, char *addr, char *rdni, char 
   isup_msg_start_optional_part(msg, sizeof(msg), &varptr, &current);
 
   /* Calling partys number Q.763 (3.10). */
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
   if((chan->cid.cid_pres & AST_PRES_RESTRICTION) == AST_PRES_RESTRICTED) {
     pres_restr = 1;
   } else {
     pres_restr = 0;
   }
   res = isup_calling_party_num_encode(chan->cid.cid_num, pres_restr, 0x3 /* network provided */, param, sizeof(param));
+#else
+  if((chan->connected.id.number.presentation & AST_PRES_RESTRICTION) == AST_PRES_RESTRICTED) {
+    pres_restr = 1;
+  } else {
+    pres_restr = 0;
+  }
+  res = isup_calling_party_num_encode(chan->connected.id.number.str, pres_restr, 0x3 /* network provided */, param, sizeof(param));
+#endif
   if(res < 0) {
     ast_log(LOG_DEBUG, "Invalid format for calling number, dropped.\n");
   } else {
@@ -2101,17 +2252,34 @@ static int isup_send_iam(struct ast_channel *chan, char *addr, char *rdni, char 
   }
 
   if (*rdni) {
-    /* ToDo: Pass on RDNIS (and redirection cause when we implement that) as
-       ISUP parameters? */
+    char* redir  = chan ? (char*) pbx_builtin_getvar_helper(chan, "SS7_REDIR") : NULL;
+    /* Default values: reason "unconditional", count "1" */
+    unsigned char reason = 0x03, rcount = 1;
     /* Q.763 3.45 */
     res = isup_calling_party_num_encode(rdni, pres_restr, 0 /* national use: user provided, not verified */, param, sizeof(param));
     isup_msg_add_optional(msg, sizeof(msg), &current, IP_REDIRECTING_NUMBER, param, res);
     param[0] = 0x04; /* redirecting indicator: call diverted, all redirection information presentation restricted,
 			original redirection reason: unknown */
-			
-    param[1] = 0x31; /* reredicting counter: 1
-			redirection reason: unconditional */
-			
+    if (redir)
+      param[0] = atoi(redir);
+    /* Read PRIREDRECTREASON and use it to set redirection reason (see ITU-T Q.763 3.44) */
+    strp = pbx_builtin_getvar_helper(chan, "PRIREDIRECTREASON");
+    if (strp) {
+      /* Parse string value */
+      reason = str2redirectreason(strp);
+    }
+    /* Read SS7_REDIRECTCOUNT and use it to set redirection counter (see ITU-T Q.763 3.44) */
+    strp = pbx_builtin_getvar_helper(chan, "SS7_REDIRECTCOUNT");
+    if (strp) {
+      char *endptr;
+      unsigned long val = strtoul(strp, &endptr, 0);
+      if ((strp == endptr) || val < 0 || val > 7)
+        ast_log(LOG_NOTICE, "Invalid redirection count value '%ld' "
+                            "in SS7_REDRECTCOUNT variable.\n", val);
+      else
+        rcount = val;
+    }
+    param[1] = ((reason & 0x0F) << 4) | (rcount & 0x07);   /* redirecting reason, counter */
     isup_msg_add_optional(msg, sizeof(msg), &current, IP_REDIRECTION_INFORMATION, param, 2);
   }
 
@@ -2120,11 +2288,11 @@ static int isup_send_iam(struct ast_channel *chan, char *addr, char *rdni, char 
 
   mtp_enqueue_isup(pvt, msg, current);
 
-  ast_verbose(VERBOSE_PREFIX_3 "Sent IAM CIC=%-3d  ANI=%s DNI=%s RNI=%s\n", pvt->cic,
-	  pres_restr ? "*****" : chan->cid.cid_num,
-          dni,
-          rdni);
-
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
+  ast_verbose(VERBOSE_PREFIX_3 "Sent IAM CIC=%-3d  ANI=%s DNI=%s RNI=%s\n", pvt->cic, pres_restr ? "*****" : chan->cid.cid_num, dni, rdni);
+#else
+  ast_verbose(VERBOSE_PREFIX_3 "Sent IAM CIC=%-3d  ANI=%s DNI=%s RNI=%s\n", pvt->cic,  pres_restr ? "*****" : chan->connected.id.number.str, dni, rdni);
+#endif
   return 0;
 }
 
@@ -2140,12 +2308,21 @@ static int ss7_call(struct ast_channel *chan, char *addr, int timeout) {
 
   ast_mutex_lock(&pvt->lock);
 
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
   ast_log(LOG_DEBUG, "SS7 call, addr=%s, cid=%s(0x%x/%s) CIC=%d. linkset '%s'\n",
           (addr ? addr : "<NULL>"),
           (chan->cid.cid_num ? chan->cid.cid_num : "<NULL>"),
           chan->cid.cid_pres,
           ast_describe_caller_presentation(chan->cid.cid_pres),
 	  pvt->cic, pvt->link->linkset->name);
+#else
+  ast_log(LOG_DEBUG, "SS7 call, addr=%s, cid=%s(0x%x/%s) CIC=%d. linkset '%s'\n",
+          (addr ? addr : "<NULL>"),
+          (chan->connected.id.number.str ? chan->connected.id.number.str : "<NULL>"),
+          chan->connected.id.number.presentation,
+          ast_describe_caller_presentation(chan->connected.id.number.presentation),
+	  pvt->cic, pvt->link->linkset->name);
+#endif
 
   pvt->addr = addr;
   pvt->attempts = 1;
@@ -2153,7 +2330,11 @@ static int ss7_call(struct ast_channel *chan, char *addr, int timeout) {
   if (sep)
     addr = sep+1;
   strcpy(dni, addr);
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
   strcpy(rdni, chan->cid.cid_rdnis ? chan->cid.cid_rdnis : "");
+#else
+  strcpy(rdni, chan->redirecting.from.number.str ? chan->redirecting.from.number.str : "");
+#endif
   sep = strchr(dni, ':');
   if (sep) {
     *sep = '\0';
@@ -2215,9 +2396,6 @@ static int ss7_hangup(struct ast_channel *chan) {
   ast_log(LOG_DEBUG, "SS7 hangup '%s' CIC=%d (state=%d), chan=0x%08lx\n",
 	  chan->name, pvt->cic, pvt->state, (unsigned long) chan);
 
-  chan->tech_pvt = NULL;
-  pvt->owner = NULL;
-
   /* Clear all the timers that may hold on to references to chan. This must be
      done while global lock is held to prevent races. */
   t1_clear(pvt);
@@ -2252,6 +2430,8 @@ static int ss7_hangup(struct ast_channel *chan) {
     pvt->echocancel = 0;
   }
   clear_audiomode(pvt->zaptel_fd);
+  chan->tech_pvt = NULL;
+  pvt->owner = NULL;
 
   ast_mutex_unlock(&pvt->lock);
   unlock_global();
@@ -2317,13 +2497,21 @@ static void ss7_handle_event(struct ss7_chan *pvt, int event) {
 #ifdef DAHDI_TONEDETECT
   if(event & DAHDI_EVENT_DTMFDOWN ) {
     pvt->frame.frametype = AST_FRAME_DTMF_BEGIN;
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
     pvt->frame.subclass = event & 0xff;
+#else
+    pvt->frame.subclass.integer = event & 0xff;
+#endif
     return ;
        
   }
   if(event &  DAHDI_EVENT_DTMFUP ) {
     pvt->frame.frametype = AST_FRAME_DTMF_END;
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
     pvt->frame.subclass = event & 0xff;
+#else
+    pvt->frame.subclass.integer = event & 0xff;
+#endif
     return;
 		
   }
@@ -2387,7 +2575,17 @@ static struct ast_frame *ss7_read(struct ast_channel * chan) {
 
   memset(&pvt->frame, 0, sizeof(pvt->frame));
   pvt->frame.frametype = AST_FRAME_VOICE;
-  pvt->frame.subclass = AST_FORMAT_ALAW;
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
+  if (variant(pvt) == ANSI_SS7)
+    pvt->frame.subclass = AST_FORMAT_ALAW;
+  else
+    pvt->frame.subclass = AST_FORMAT_ULAW;
+#else
+  if (variant(pvt) == ANSI_SS7)
+    pvt->frame.subclass.codec = AST_FORMAT_ULAW;
+  else
+    pvt->frame.subclass.codec = AST_FORMAT_ALAW;
+#endif
   pvt->frame.samples = AUDIO_READSIZE;
   pvt->frame.mallocd = 0;
   pvt->frame.src = NULL;
@@ -2486,11 +2684,19 @@ static int ss7_write(struct ast_channel * chan, struct ast_frame *frame) {
 
   ast_mutex_lock(&pvt->lock);
 
-  if(frame->frametype != AST_FRAME_VOICE || frame->subclass != AST_FORMAT_ALAW) {
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
+  if((frame->frametype != AST_FRAME_VOICE) || ((frame->subclass != AST_FORMAT_ALAW) && (frame->subclass != AST_FORMAT_ULAW))) {
     ast_mutex_unlock(&pvt->lock);
     ast_log(LOG_WARNING, "Unexpected frame.\n");
     return -1;
   }
+#else
+  if((frame->frametype != AST_FRAME_VOICE) || ((frame->subclass.codec != AST_FORMAT_ALAW) && (frame->subclass.codec != AST_FORMAT_ULAW))) {
+    ast_mutex_unlock(&pvt->lock);
+    ast_log(LOG_WARNING, "Unexpected frame type=%d, subclass=%d.\n", frame->frametype, frame->subclass.integer);
+    return -1;
+  }
+#endif
 
   if(pvt->sending_dtmf) {
     /* If we send audio while playing DTMF, the tone seems to be lost. */
@@ -2555,7 +2761,11 @@ static struct ast_frame *ss7_exception(struct ast_channel *chan) {
 
   memset(&pvt->frame, 0, sizeof(pvt->frame));
   pvt->frame.frametype = AST_FRAME_NULL;
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
   pvt->frame.subclass = 0;
+#else
+  pvt->frame.subclass.integer = 0;
+#endif
   pvt->frame.samples = 0;
   pvt->frame.mallocd = 0;
   pvt->frame.src = NULL;
@@ -3030,7 +3240,11 @@ static void process_sam(struct ss7_chan *pvt, struct isup_msg *inmsg)
 static void process_acm(struct ss7_chan *pvt, struct isup_msg *inmsg)
 {
   struct ast_channel* chan = pvt->owner;
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
   static struct ast_frame ring_frame = { AST_FRAME_CONTROL, AST_CONTROL_RINGING };
+#else
+  static struct ast_frame ring_frame = { AST_FRAME_CONTROL, {AST_CONTROL_RINGING} };
+#endif
 
   /* Q.764 (2.1.4.6 a): When receiving ACM, stop T7 and start T9. */
   t7_clear(pvt);
@@ -3064,7 +3278,11 @@ static void process_acm(struct ss7_chan *pvt, struct isup_msg *inmsg)
 static void process_anm(struct ss7_chan *pvt, struct isup_msg *inmsg)
 {
   struct ast_channel* chan = pvt->owner;
-  static struct ast_frame answer_frame = { AST_FRAME_CONTROL, AST_CONTROL_ANSWER };
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
+  static struct ast_frame answer_frame = { AST_FRAME_CONTROL, AST_CONTROL_RINGING };
+#else
+  static struct ast_frame answer_frame = { AST_FRAME_CONTROL, {AST_CONTROL_ANSWER} };
+#endif
 
   /* Q.764 (2.1.7.6): When receiving ANM, stop T9. */
   t9_clear(pvt);
@@ -3100,7 +3318,11 @@ static void process_anm(struct ss7_chan *pvt, struct isup_msg *inmsg)
 static void process_con(struct ss7_chan *pvt, struct isup_msg *inmsg)
 {
   struct ast_channel* chan = pvt->owner;
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
   static struct ast_frame answer_frame = { AST_FRAME_CONTROL, AST_CONTROL_ANSWER };
+#else
+  static struct ast_frame answer_frame = { AST_FRAME_CONTROL, {AST_CONTROL_ANSWER} };
+#endif
 
   t7_clear(pvt);
 
@@ -3230,7 +3452,11 @@ static void process_rel(struct ss7_chan *pvt, struct isup_msg *inmsg)
     pvt->state = ST_SENT_REL;
     return;
   }
-
+  if (chan) {
+    handle_redir_info(chan, &inmsg->rel.redir_inf);
+    if(inmsg->rel.rdni.present)
+      pbx_builtin_setvar_helper(chan, "SS7_RDNI", inmsg->rel.rdni.num);
+  }
   if(pvt->state != ST_IDLE && pvt->state != ST_SENT_REL) {
     if(chan != NULL) {
       /* The channel has already been locked in process_isup_message(). */
@@ -3368,6 +3594,22 @@ static void process_rsc(struct ss7_chan *pvt, struct isup_msg *inmsg)
   }
   /* Send "Release Confirmed", Q.764 (2.9.3.1 b). */
   isup_send_rlc(pvt);	
+}
+
+/* Process block acknowledgement message */
+static void process_bla(struct ss7_chan *pvt, struct isup_msg *inmsg)
+{
+  /* Mark the circuit as blocked. */
+  pvt->blocked |= BL_LM;
+  t12_clear(pvt);
+}
+
+/* Process unblock acknowledgement message */
+static void process_uba(struct ss7_chan *pvt, struct isup_msg *inmsg)
+{
+  /* Mark the circuit as unblocked. */
+  pvt->blocked &= ~BL_LM;
+  t14_clear(pvt);
 }
 
 /* Process block message */
@@ -3871,6 +4113,14 @@ static void process_isup_message(struct link* slink, struct isup_msg *inmsg)
     process_circuit_message(slink, inmsg, process_cot);
     break;
 
+  case ISUP_BLA:
+    process_circuit_message(slink, inmsg, process_bla);
+    break;
+
+  case ISUP_UBA:
+    process_circuit_message(slink, inmsg, process_uba);
+    break;
+
   case ISUP_GRS:
     process_circuit_group_message(slink, inmsg, handle_GRS_send_hwblock);
     break;
@@ -4211,7 +4461,7 @@ static int do_group_circuit_block_unblock(struct linkset* linkset, int firstcic,
 }
 
 
-static int cmd_block_unblock(int fd, int argc, char *argv[], int do_block) {
+static int cmd_block_unblock(int fd, int argc, argv_type argv, int do_block) {
   struct ss7_chan *pvt;
   int first, count;
   int res = 0;
@@ -4222,7 +4472,7 @@ static int cmd_block_unblock(int fd, int argc, char *argv[], int do_block) {
 
   if (argc >= 5) {
     int lsi;
-    char* linksetname = argv[4];
+    const char* linksetname = argv[4];
     linkset = NULL;
     for (lsi = 0; lsi < n_linksets; lsi++)
       if (strcmp(linksets[lsi].name, linksetname) == 0)
@@ -4276,16 +4526,16 @@ static int cmd_block_unblock(int fd, int argc, char *argv[], int do_block) {
   return RESULT_SUCCESS;
 }
 
-int cmd_block(int fd, int argc, char *argv[]) {
+int cmd_block(int fd, int argc, argv_type argv) {
   return cmd_block_unblock(fd, argc, argv, 1);
 }
 
-int cmd_unblock(int fd, int argc, char *argv[]) {
+int cmd_unblock(int fd, int argc, argv_type argv) {
   return cmd_block_unblock(fd, argc, argv, 0);
 }
 
 
-int cmd_linestat(int fd, int argc, char *argv[]) {
+int cmd_linestat(int fd, int argc, argv_type argv) {
   int lsi;
   char* format = "CIC %3d %-15s%s\n";
 
@@ -4363,7 +4613,7 @@ int cmd_linestat(int fd, int argc, char *argv[]) {
 }
 
 
-int cmd_reset(int fd, int argc, char *argv[]) {
+int cmd_reset(int fd, int argc, argv_type argv) {
   int i, lsi;
   struct ss7_chan* idle_list;
 
@@ -4417,7 +4667,7 @@ int cmd_reset(int fd, int argc, char *argv[]) {
   return RESULT_SUCCESS;
 }
 
-int cmd_linkset_status(int fd, int argc, char *argv[]) {
+int cmd_linkset_status(int fd, int argc, argv_type argv) {
   int i, lsi;
   struct ss7_chan* cur;
 
@@ -4567,10 +4817,10 @@ static int set_gain(struct ss7_chan *pvt, float rx_gain, float tx_gain) {
 
 
 /* Initialize a struct ss7_chan. */
-static void init_pvt(struct ss7_chan *pvt, int cic) {
+static void init_pvt(struct ss7_chan *pvt, struct link* link, int cic) {
   pvt->owner = NULL;
   pvt->next_idle = NULL;
-  pvt->link = NULL;
+  pvt->link = link;
   pvt->cic = cic;
   pvt->reset_done = 0;
   pvt->blocked = 0;
@@ -4599,7 +4849,21 @@ static void init_pvt(struct ss7_chan *pvt, int cic) {
   memset(pvt->buffer, 0, sizeof(pvt->buffer));
   memset(&pvt->frame, 0, sizeof(pvt->frame));
   pvt->frame.frametype = AST_FRAME_VOICE;
-  pvt->frame.subclass = AST_FORMAT_ALAW;
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
+  if (variant(pvt) == ANSI_SS7)
+    pvt->frame.subclass = AST_FORMAT_ALAW;
+  else
+    pvt->frame.subclass = AST_FORMAT_ULAW;
+#else
+  if (variant(pvt) == ANSI_SS7) {
+    pvt->frame.subclass.codec = AST_FORMAT_ULAW;
+    pvt->law = DAHDI_LAW_MULAW;
+  }
+  else {
+    pvt->frame.subclass.codec = AST_FORMAT_ALAW;
+    pvt->law = DAHDI_LAW_ALAW;
+  }
+#endif
   pvt->frame.samples = AUDIO_READSIZE;
   pvt->frame.mallocd = 0;
   pvt->frame.src = NULL;
@@ -4615,7 +4879,6 @@ static void init_pvt(struct ss7_chan *pvt, int cic) {
   pvt->is_digital = 0;
   pvt->grs_count = -1;
   pvt->cgb_mask = 0;
-  pvt->law = DAHDI_LAW_ALAW;
   memset(pvt->context, 0, sizeof(pvt->context));
   memset(pvt->language, 0, sizeof(pvt->language));
 };
@@ -4663,8 +4926,7 @@ static int setup_cic(struct link* link, int channel)
     ast_log(LOG_ERROR, "Out of memory allocating %zu bytes.\n", sizeof(*pvt));
     return -1;
   }
-  init_pvt(pvt, cic);
-  pvt->link = link;
+  init_pvt(pvt, link, cic);
   pvt->equipped = 1;
   if(ctxt != NULL) {
     ast_copy_string(pvt->context, ctxt, sizeof(pvt->context));
@@ -4791,6 +5053,10 @@ void l4isup_event(struct mtp_event* event)
     ast_log(LOG_NOTICE, "ISUP decoding error, message discarded. (typ=%d)\n", isup_msg.typ);
   } else {
     struct ss7_chan* pvt = find_pvt_with_pc(event->isup.slink, isup_msg.cic, isup_msg.opc);
+    {
+      ast_log(LOG_WARNING, "Received %s (CIC %d), link '%s'.\n", isupmsg(isup_msg.typ), isup_msg.cic, event->isup.slink->name);
+    }
+
     if (pvt) {
       if(pvt->equipped)
 	process_isup_message(pvt->link, &isup_msg);
@@ -4807,41 +5073,44 @@ void l4isup_event(struct mtp_event* event)
 
 
 int isup_init(void) {
-  int i;
+  int i, l;
 
   /* Configure CIC ranges, specified in 'channel' lines. */
-  ast_log(LOG_DEBUG, "Links %d, host %s \n", this_host->n_spans, this_host->name);
+  ast_log(LOG_DEBUG, "Spans %d, host %s \n", this_host->n_spans, this_host->name);
   for (i = 0; i < this_host->n_spans; i++) {
-    struct link* link = this_host->spans[i].link;
-    int connector = this_host->spans[i].connector;
-    int firstcic = link->first_cic;
-    int c;
-    if (!link->enabled)
-      continue;
-    ast_log(LOG_DEBUG, "New CIC, first_zapid %d, channelmask 0x%08lx, connector %d, firstcic %d, schannel 0x%04x \n", link->first_zapid, link->channelmask, connector, firstcic, link->schannel.mask);
-    for (c = 0; c < 31; c++) {
-      if (link->channelmask & (1 << c)) {
-	int cic = firstcic + c;
-	/* channel to zap id mapping:
-	   1 -> 1, 2 -> 2, 3 -> 3, ...
-	   32-> none
-	   33 -> 32, 34 -> 33, 35 -> 34, ...
-	   64-> none
-	   65 -> 63, 66 -> 64, 67 -> 65, ...
-	   96-> none
-	   97 -> 94, 98 -> 95, 99 -> 96, ...
-	   128-> none */
-	if ((1<<c) & link->schannel.mask) {
-	  ast_log(LOG_ERROR, "Error: Zap channel %d is used for SS7 signalling, "
-		  "hence cannot be allocated for a CIC.\n", c+1);
-	  return -1;
-	}
-	if(link->linkset->cic_list[cic] != NULL) {
-	  ast_log(LOG_ERROR, "Overlapping CIC=%d, aborting.\n", cic);
-	  return -1;
-	}            
-	if(setup_cic(link, c)) {
-	  return -1;
+    ast_log(LOG_DEBUG, "Span %d, links %d, host %s \n", i+1, this_host->spans[i].n_links, this_host->name);
+    for (l = 0; l < this_host->spans[i].n_links; l++) {
+      struct link* link = this_host->spans[i].links[l];
+      int connector = this_host->spans[i].connector;
+      int firstcic = link->first_cic;
+      int c;
+      if (!link->enabled)
+	continue;
+      ast_log(LOG_DEBUG, "New CICs, span %d, link %d, first_zapid %d, channelmask 0x%08lx, connector %d, firstcic %d, schannel 0x%08ux \n", i+1, l+1, link->first_zapid, link->channelmask, connector, firstcic, link->schannel.mask);
+      for (c = 0; c < 31; c++) {
+	if (link->channelmask & (1 << c)) {
+	  int cic = firstcic + c;
+	  /* channel to zap id mapping:
+	     1 -> 1, 2 -> 2, 3 -> 3, ...
+	     32-> none
+	     33 -> 32, 34 -> 33, 35 -> 34, ...
+	     64-> none
+	     65 -> 63, 66 -> 64, 67 -> 65, ...
+	     96-> none
+	     97 -> 94, 98 -> 95, 99 -> 96, ...
+	     128-> none */
+	  if ((1<<c) & link->schannel.mask) {
+	    ast_log(LOG_ERROR, "Error: Zap channel %d is used for SS7 signalling, "
+		    "hence cannot be allocated for a CIC.\n", c+1);
+	    return -1;
+	  }
+	  if(link->linkset->cic_list[cic] != NULL) {
+	    ast_log(LOG_ERROR, "Overlapping CIC=%d, aborting.\n", cic);
+	    return -1;
+	  }            
+	  if(setup_cic(link, c)) {
+	    return -1;
+	  }
 	}
       }
     }
@@ -4849,27 +5118,34 @@ int isup_init(void) {
 
   /* Configure all links that are on our linksets */
   for (i = 0; i < this_host->n_spans; i++) {
-    struct linkset* linkset = this_host->spans[i].link->linkset;
-    int li;
-    for(li = 0; li < linkset->n_links; li++) {
-      struct link* link = linkset->links[li];
-      int c;
-      for (c = 0; c < 32; c++) {
-	int cic = link->first_cic + c;
-	struct ss7_chan* pvt;
-	if (linkset->cic_list[cic])
-	  continue;
-	if (link->channelmask & (1 << c)) {
-	  pvt = malloc(sizeof(*pvt));
-	  if(pvt == NULL) {
-	    ast_log(LOG_ERROR, "Out of memory allocating %zu bytes.\n", sizeof(*pvt));
-	    return -1;
+    for (l = 0; l < this_host->spans[i].n_links; l++) {
+      struct linkset* slinkset = this_host->spans[i].links[l]->linkset;
+      int lsi;
+      for (lsi = 0; lsi < n_linksets; lsi++) {
+	struct linkset* linkset = &linksets[lsi];
+	if (is_combined_linkset(slinkset, linkset)) {
+	  int li;
+	  for(li = 0; li < linkset->n_links; li++) {
+	    struct link* link = linkset->links[li];
+	    int c;
+	    for (c = 0; c < 32; c++) {
+	      int cic = link->first_cic + c;
+	      struct ss7_chan* pvt;
+	      if (linkset->cic_list[cic])
+		continue;
+	      if (link->channelmask & (1 << c)) {
+		pvt = malloc(sizeof(*pvt));
+		if(pvt == NULL) {
+		  ast_log(LOG_ERROR, "Out of memory allocating %zu bytes.\n", sizeof(*pvt));
+		  return -1;
+		}
+		init_pvt(pvt, link, cic);
+		ast_log(LOG_DEBUG, "Configuring peers CIC %d on linkset '%s'\n", cic, linkset->name);
+		linkset->cic_list[cic] = pvt;
+		pvt->equipped = 0;
+	      }
+	    }
 	  }
-	  init_pvt(pvt, cic);
-	  ast_log(LOG_DEBUG, "Configuring peers CIC %d on linkset '%s'\n", cic, linkset->name);
-	  linkset->cic_list[cic] = pvt;
-	  pvt->link = link;
-	  pvt->equipped = 0;
 	}
       }
     }

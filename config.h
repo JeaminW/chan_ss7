@@ -1,9 +1,8 @@
 /* config.h - chan_ss7 configuration
  *
- * Copyright (C) 2006, Sifira A/S.
+ * Copyright (C) 2006-2011 Netfors ApS.
  *
- * Author: Anders Baekgaard <ab@sifira.dk>
- *         Anders Baekgaard <ab@netfors.com>
+ * Author: Anders Baekgaard <ab@netfors.com>
  *
  * This file is part of chan_ss7.
  *
@@ -25,7 +24,15 @@
 
 #define AST_MODULE "chan_ss7"
 
-typedef enum {ITU_SS7, CHINA_SS7} ss7_variant;
+#if defined(USE_ASTERISK_1_2) || defined(USE_ASTERISK_1_4) || defined(USE_ASTERISK_1_6)
+#define argv_type char**
+#else
+#define argv_type const char* const*
+#endif
+
+
+
+typedef enum {ITU_SS7, ANSI_SS7, CHINA_SS7} ss7_variant;
 
 /* Hunting policy. */
 typedef enum { HUNT_ODD_LRU, HUNT_EVEN_MRU, HUNT_SEQ_LTH, HUNT_SEQ_HTL } hunting_policy;
@@ -33,14 +40,15 @@ typedef enum { BL_LM=1, BL_LH=2, BL_RM=4, BL_RH=8, BL_UNEQUIPPED=0x10, BL_LINKDO
 
 /* Upper bounds only determined by installed hardware, use decent values */
 #define MAX_E1_CONNECTOR_NO 32
+#define MAX_TIMESLOT 32
 #define MAX_CIC 4096
-#define MAX_LINKSETS 8
+#define MAX_LINKSETS 16
 #define MAX_LINKS 128
-#define MAX_LINKS_PER_LINKSET 16
+#define MAX_LINKS_PER_LINKSET 128
 #define MAX_LINKS_PER_HOST 32
 #define MAX_SPANS_PER_HOST 32
-#define MAX_SCHANNELS 16
-#define MAX_SCHANNELS_PER_E1 16
+#define MAX_SCHANNELS 32
+#define MAX_SCHANNELS_PER_LINKSET 16
 #define MAX_IFS_PER_HOST 2
 #define MAX_HOSTS 16
 #define MAX_ROUTES_PER_HOST 16
@@ -104,7 +112,7 @@ struct link {
   int first_zapid;
   unsigned long channelmask;
   int first_cic;
-  int sls[MAX_SCHANNELS_PER_E1];
+  int sls[MAX_SCHANNELS_PER_LINKSET];
   int enabled;
   int send_sltm;
   int auto_block;
@@ -164,7 +172,8 @@ struct host {
 
   /* E1/T1 connections */
   struct {
-    struct link* link;
+    struct link* links[MAX_TIMESLOT];
+    int n_links;
     int connector;
   } spans[MAX_SPANS_PER_HOST];
 

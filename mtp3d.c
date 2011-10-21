@@ -1,9 +1,9 @@
 /* mtp3d.c - mtp2/mtp3 daemon
+ *
+ * Copyright (C) 2006-2011 Netfors ApS.
+ *
  * Author: Anders Baekgaard <ab@netfors.com>
- * This work is derived from chan_ss7, see copyright below.
- */
-
-/*
+ *
  * This file is part of chan_ss7.
  *
  * chan_ss7 is free software; you can redistribute it and/or modify
@@ -261,19 +261,21 @@ void l4isup_event(struct mtp_event* event)
     int opc = isup_msg.opc;
     int dpc = isup_msg.dpc;
     int cic = isup_msg.cic;
-    int i, n;
+    int i, n, l;
     struct linkset* linkset = event->isup.slink->linkset;
     ast_log(LOG_DEBUG, "ISUP event, OPC=%d, DPC=%d, CIC=%d, typ=%s\n", opc, dpc,  cic, isupmsg(isup_msg.typ));
     for (n = 0; n < n_registry; n++) {
       if (registry[n].ss7_protocol == SS7_PROTO_ISUP) {
 	struct host* host = lookup_host_by_id(registry[n].host_ix);
 	for (i = 0; i < host->n_spans; i++) {
-	  struct link* link = host->spans[i].link;
-	  if (link->linkset == linkset) {
-	    if ((link->first_cic <= cic) && (link->first_cic+32 > cic)) {
-	      event->isup.slinkix = event->isup.slink->linkix;
-	      mtp3_reply(registry[n].peerfd, (void*) event, sizeof(*event)+event->len, (const struct sockaddr*) &registry[n].client, sizeof(registry[n].client));
-	      return;
+	  for (l = 0; l < host->spans[i].n_links; l++) {
+	    struct link* link = host->spans[i].links[l];
+	    if (link->linkset == linkset) {
+	      if ((link->first_cic <= cic) && (link->first_cic+32 > cic)) {
+		event->isup.slinkix = event->isup.slink->linkix;
+		mtp3_reply(registry[n].peerfd, (void*) event, sizeof(*event)+event->len, (const struct sockaddr*) &registry[n].client, sizeof(registry[n].client));
+		return;
+	      }
 	    }
 	  }
 	}
@@ -627,9 +629,25 @@ static void usage(void)
 }
 
   
+static void reopen_logfiles(void)
+{
+  if (!freopen("/var/log/mtp3d.log", "a", stdout)) {
+    fprintf(stderr, "Cannot open /var/log/mtp3d.log for writing\n");
+    exit(1);
+  }
+  if (!freopen("/var/log/mtp3d.log", "a", stderr))
+    fprintf(stderr, "Cannot open /var/log/mtp3d.log for writing\n");
+}
+
 static void sigterm(int p)
 {
   monitor_running = 0;
+}
+
+static void sighup(int p)
+{
+  reopen_logfiles();
+  ast_log(LOG_NOTICE, "Log file reopened\n");
 }
 
 static void sigpipe(int p)
@@ -644,6 +662,8 @@ static void setsigactions(void)
   sa.sa_flags = 0;
   sa.sa_handler= sigterm;
   sigaction(SIGTERM, &sa, NULL);
+  sa.sa_handler= sighup;
+  sigaction(SIGHUP, &sa, NULL);
   sa.sa_handler= sigpipe;
   sigaction(SIGPIPE, &sa, NULL);
 }
@@ -651,8 +671,10 @@ static void setsigactions(void)
 static int setup_daemon(void)
 {
   if (do_fork) {
-    if (!daemon(0, 1))
-      fprintf(stderr, "daemon returned error: %d: %s\n", errno, strerror(errno));
+    if (daemon(0, 1)) {
+      fprintf(stderr, "daemon returned error: %d: %s, exiting\n", errno, strerror(errno));
+      exit(1);
+    }
   }
   setsigactions();
   return 0;
@@ -735,12 +757,7 @@ int main(int argc, char* argv[])
   }
   is_mtp3d = 1;
   if (do_fork) {
-    if (!freopen("/var/log/mtp3d.log", "a", stdout)) {
-      fprintf(stderr, "Cannot open /var/log/mtp3d.log for writing\n");
-      exit(1);
-    }
-    if (!freopen("/var/log/mtp3d.log", "a", stderr))
-      fprintf(stderr, "Cannot open /var/log/mtp3d.log for writing\n");
+    reopen_logfiles();
   }
   printf("Using %s for config directory\n", ast_config_AST_CONFIG_DIR);
   if(load_config(0)) {

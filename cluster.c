@@ -1,8 +1,8 @@
 /* cluster.c - chan_ss7 clustering/redundancy
  *
- * Copyright (C) 2006, Sifira A/S.
+ * Copyright (C) 2006-2011 Netfors ApS.
  *
- * Author: Anders Baekgaard <ab@sifira.dk>
+ * Author: Anders Baekgaard <ab@netfors.com>
  *
  * This file is part of chan_ss7.
  *
@@ -55,6 +55,7 @@
 
 #include "astversion.h"
 #include "config.h"
+#include "cli.h"
 #include "lffifo.h"
 #include "utils.h"
 #include "mtp3io.h"
@@ -154,9 +155,12 @@ static void declare_host_state(struct host* host, alivestate state)
       }
       if (isup_block_handler) {
 	for (i = 0; i < host->n_spans; i++) {
-	  struct link* link = host->spans[i].link;
-	  if (link->enabled)
-	    (*isup_block_handler)(link);
+	  int l;
+	  for (l = 0; l < this_host->spans[i].n_links; l++) {
+	    struct link* link = host->spans[i].links[l];
+	    if (link->enabled)
+	      (*isup_block_handler)(link);
+	  }
 	}
       }
       ast_log(LOG_WARNING, "No alive signal from %s, assumed down.\n", host->name);
@@ -296,13 +300,15 @@ int cluster_receivers_alive(struct linkset* linkset)
     for (i = 0; i < this_host->n_receivers; i++) {
       for (j = 0; j < this_host->receivers[i].n_targets; j++) {
 	struct host* host = this_host->receivers[i].targets[j].host;
-	int l;
+	int k, l;
 	if (host->state != STATE_ALIVE)
 	  continue;
-	for (l = 0; l < host->n_spans; l++) {
-	  struct link* link = host->spans[l].link;
-	  if (link->schannel.mask)
-	    return 1;
+	for (k = 0; k < host->n_spans; k++) {
+	  for (l = 0; l < host->spans[k].n_links; l++) {
+	    struct link* link = host->spans[k].links[l];
+	    if (link->schannel.mask)
+	      return 1;
+	  }
 	}
       }
     }
@@ -556,7 +562,7 @@ static int cluster_receive_packet(int senderix, int fd)
   }
   host_last_seq_no[hostix] = event->seq_no;
   if (res > 0) {
-    ast_log(LOG_DEBUG, "Received event, senderix=%d, hostix=%d, lastseq=%ld, seqno=%ld, typ=%d\n", senderix, hostix, host_last_seq_no[hostix], event->seq_no, event->typ);
+    ast_log(LOG_DEBUG, "Received event, senderix=%d, hostix=%d, lastseq=%ld, seqno=%d, typ=%d\n", senderix, hostix, host_last_seq_no[hostix], event->seq_no, event->typ);
     if ((event->typ == MTP_EVENT_ISUP) || (event->typ == MTP_REQ_ISUP_FORWARD)) {
       if (isup_event_handler)
 	(*isup_event_handler)(event);
@@ -828,11 +834,13 @@ int cluster_init(void (*isup_event_handler_callback)(struct mtp_event*),
   for (i = 0; i < this_host->n_receivers; i++) {
     for (j = 0; j < this_host->receivers[i].n_targets; j++) {
       struct host* host = this_host->receivers[i].targets[j].host;
-      int l;
-      for (l = 0; l < host->n_spans; l++) {
-	struct link* link = host->spans[l].link;
-	if (link->schannel.mask)
-	  this_host->has_signalling_receivers = 1;
+      int l, k;
+      for (k = 0; k < host->n_spans; k++) {
+	for (l = 0; l < host->spans[k].n_links; l++) {
+	  struct link* link = host->spans[k].links[l];
+	  if (link->schannel.mask)
+	    this_host->has_signalling_receivers = 1;
+	}
       }
     }
   }
@@ -957,21 +965,21 @@ void cluster_cleanup(void)
 }
 
 
-int cmd_cluster_start(int fd, int argc, char *argv[])
+int cmd_cluster_start(int fd, int argc, argv_type argv)
 {
   if (!cluster_running)
     return cluster_init(isup_event_handler, isup_block_handler);
   return 0;
 }
 
-int cmd_cluster_stop(int fd, int argc, char *argv[])
+int cmd_cluster_stop(int fd, int argc, argv_type argv)
 {
   if (cluster_running)
     cluster_cleanup();
   return 0;
 }
 
-int cmd_cluster_status(int fd, int argc, char *argv[])
+int cmd_cluster_status(int fd, int argc, argv_type argv)
 {
   int i;
   int linkix, targetix;

@@ -1,9 +1,8 @@
 /* isup.c - ISUP stuff.
  *
- * Copyright (C) 2005-2006, Sifira A/S.
+ * Copyright (C) 2005-2011, Netfors ApS.
  *
  * Author: Kristian Nielsen <kn@sifira.dk>
- *         Anders Baekgaard <ab@sifira.dk>
  *         Anders Baekgaard <ab@netfors.com>
  *
  * This file is part of chan_ss7.
@@ -350,7 +349,7 @@ static int decode_redir_inf(unsigned char *p, int len, void *data) {
     return 0;
   }
 
-  redir_inf_ptr->is_redirect = 1;
+  redir_inf_ptr->is_redirect = p[0];
   if(len >= 2) {
     redir_inf_ptr->reason = (p[1] >> 4) & 0xf;
   } else {
@@ -587,6 +586,8 @@ int decode_isup_msg(struct isup_msg *msg, ss7_variant variant, unsigned char *bu
   
   if(variant==ITU_SS7)
   	i = 7;
+  else if(variant==ANSI_SS7)
+  	i = 10;
   else
   	i =10;
   
@@ -604,6 +605,17 @@ int decode_isup_msg(struct isup_msg *msg, ss7_variant variant, unsigned char *bu
     msg->typ = buf[6];
     buf += 7;
     len -= 7;
+  }
+  else if(variant==ANSI_SS7) {
+    msg->dpc = buf[0] | ((buf[1] & 0xff) << 8) | ((buf[2] & 0xff) << 16);
+    msg->opc = buf[3] | ((buf[4] & 0xff) << 8) | ((buf[5] & 0xff) << 16);
+    msg->sls = buf[6] & 0x0f;
+
+    msg->cic = buf[7] | ((buf[8] & 0x0f) << 8);
+    msg->typ = buf[9];
+
+    buf += 10;
+    len -= 10;
   } else { /* CHINA SS7 */
     msg->dpc = buf[0] | ((buf[1] & 0xff) << 8) | ((buf[2] & 0xff) << 16);
     msg->opc = buf[3] | ((buf[4] & 0xff) << 8) | ((buf[5] & 0xff) << 16);
@@ -624,19 +636,34 @@ int decode_isup_msg(struct isup_msg *msg, ss7_variant variant, unsigned char *bu
       clear_isup_phonenum(&msg->iam.rni);
       msg->iam.redir_inf.is_redirect = 0;
       msg->iam.redir_inf.reason = 0;
-      return param_decode(buf, len,
-                          IP_NATURE_OF_CONNECTION_INDICATORS, 1, decode_noci_contcheck, &msg->iam,
-                          IP_FORWARD_CALL_INDICATORS, 2, NULL, NULL,
-                          IP_CALLING_PARTYS_CATEGORY, 1, NULL, NULL,
-                          IP_TRANSMISSION_MEDIUM_REQUIREMENT, 1, decode_transmission_medium, &msg->iam,
-                          0,
-                          IP_CALLED_PARTY_NUMBER, decode_dni, &msg->iam.dni,
-                          0,
-                          IP_CALLING_PARTY_NUMBER, decode_ani_rni, &msg->iam.ani,
-                          IP_REDIRECTING_NUMBER, decode_ani_rni, &msg->iam.rni,
-                          IP_REDIRECTION_INFORMATION, decode_redir_inf, &msg->iam.redir_inf,
-                          IP_GENERIC_NUMBER, decode_generic_number, &msg->iam.gni,
-                          0);
+      if(variant==ANSI_SS7)
+	return param_decode(buf, len,
+			    IP_NATURE_OF_CONNECTION_INDICATORS, 1, decode_noci_contcheck, &msg->iam,
+			    IP_FORWARD_CALL_INDICATORS, 2, NULL, NULL,
+			    IP_CALLING_PARTYS_CATEGORY, 1, NULL, NULL,
+			    0,
+			    IP_USER_SERVICE_INFORMATION, NULL, NULL,
+			    IP_CALLED_PARTY_NUMBER, decode_dni, &msg->iam.dni,
+			    0,
+			    IP_CALLING_PARTY_NUMBER, decode_ani_rni, &msg->iam.ani,
+			    IP_REDIRECTING_NUMBER, decode_ani_rni, &msg->iam.rni,
+			    IP_REDIRECTION_INFORMATION, decode_redir_inf, &msg->iam.redir_inf,
+			    IP_GENERIC_NUMBER, decode_generic_number, &msg->iam.gni,
+			    0);
+      else
+	return param_decode(buf, len,
+			    IP_NATURE_OF_CONNECTION_INDICATORS, 1, decode_noci_contcheck, &msg->iam,
+			    IP_FORWARD_CALL_INDICATORS, 2, NULL, NULL,
+			    IP_CALLING_PARTYS_CATEGORY, 1, NULL, NULL,
+			    IP_TRANSMISSION_MEDIUM_REQUIREMENT, 1, decode_transmission_medium, &msg->iam,
+			    0,
+			    IP_CALLED_PARTY_NUMBER, decode_dni, &msg->iam.dni,
+			    0,
+			    IP_CALLING_PARTY_NUMBER, decode_ani_rni, &msg->iam.ani,
+			    IP_REDIRECTING_NUMBER, decode_ani_rni, &msg->iam.rni,
+			    IP_REDIRECTION_INFORMATION, decode_redir_inf, &msg->iam.redir_inf,
+			    IP_GENERIC_NUMBER, decode_generic_number, &msg->iam.gni,
+			    0);
 
     case ISUP_SAM:
       /* Must initialize optional parameters, in case they are not
@@ -689,14 +716,23 @@ int decode_isup_msg(struct isup_msg *msg, ss7_variant variant, unsigned char *bu
                           0,
                           IP_CAUSE_INDICATORS, decode_rel_cause, &(msg->rel.cause),
                           0,
+                          IP_REDIRECTION_NUMBER, decode_dni, &msg->rel.rdni,
+                          IP_REDIRECTION_INFORMATION, decode_redir_inf, &msg->rel.redir_inf,
                           0);
 
     case ISUP_RLC:
-      return param_decode(buf, len,
-                          0,
-                          0,
-                          IP_CAUSE_INDICATORS, NULL, NULL,
-                          0);
+      if(variant==ANSI_SS7)
+	return param_decode(buf, len,
+			    0,
+			    0,
+			    0,
+			    0);
+      else
+	return param_decode(buf, len,
+			    0,
+			    0,
+			    IP_CAUSE_INDICATORS, NULL, NULL,
+			    0);
 
     case ISUP_SUS:
       return param_decode(buf, len,
@@ -819,6 +855,12 @@ void isup_msg_init(unsigned char *buf, int buflen, ss7_variant variant, int opc,
   mtp3_put_label((cic & 0x000f), variant, opc, dpc, &(buf[*current]));
   if(variant==ITU_SS7) {
     *current += 4;
+    buf[(*current)++] = cic & 0xff;
+    buf[(*current)++] = (cic & 0x0f00) >> 8;
+    buf[(*current)++] = msg_type;
+  }
+  else if(variant==ANSI_SS7) {
+    *current += 7;
     buf[(*current)++] = cic & 0xff;
     buf[(*current)++] = (cic & 0x0f00) >> 8;
     buf[(*current)++] = msg_type;

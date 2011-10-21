@@ -1,9 +1,9 @@
 /* mtp3io.h - MTP transport over mtp3d sockets interface
+ *
+ * Copyright (C) 2006-2011 Netfors ApS.
+ *
  * Author: Anders Baekgaard <ab@netfors.com>
- * This work is included with chan_ss7, see copyright below.
- */
-
-/*
+ *
  * This file is part of chan_ss7.
  *
  * chan_ss7 is free software; you can redistribute it and/or modify
@@ -21,6 +21,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#pragma pack(push,4)
 
 #define MTP3_SOCKETTYPE SOCK_STREAM
 #define MTP3_IPPROTO IPPROTO_TCP
@@ -37,7 +38,7 @@
 #define MTP_REQ_MAX_SIZE (sizeof(struct mtp_req) + MTP_MAX_PCK_SIZE)
 
 struct mtp_req {
-  /* The "typ" fiend determines which element in the union is used. */
+  /* The "typ" field determines which element in the union is used. */
   enum {
     MTP_REQ_ISUP,               /* Queue ISUP MSU for sending on link */
     MTP_REQ_SCCP,               /* Queue SCCP MSU for sending on link */
@@ -48,32 +49,43 @@ struct mtp_req {
     MTP_REQ_CLI,                /* CLI interaction request */
   } typ;
 
-  unsigned long seq_no;
+  unsigned char infversion[4];
+  unsigned int seq_no;
+  unsigned int padding0[8];
 
   union {
     struct {
+      int opc;
+      int dpc;
+      short slc;
+      short slinkix;
       struct link* slink;
       struct link* link;
-      int slinkix;
     } isup;
     struct {
+      int opc;
+      int dpc;
+      short slc;
+      short slinkix;
       struct link* slink;
-      int slinkix;
     } sccp;
     struct {
-      int linkix;
-      int keepdown;
+      short linkix;
+      short keepdown;
     } link;
     struct {
-      int ss7_protocol;
-      int host_ix;
-      int linkix;
+      short ss7_protocol;
+      short host_ix;
+      short linkix;
       union {
 	struct {
-	  int subsystem;
+	  short subsystem;
 	} sccp;
       };
     } regist;
+    struct {
+      unsigned char padding[72];
+    } padding;
   };
 
   int len;
@@ -95,40 +107,48 @@ struct mtp_event {
     MTP_EVENT_LAST,             /* Placeholder, Must be last in enumeration */
   } typ;
 
-  unsigned long seq_no;
+  unsigned char infversion[4];
+  unsigned int seq_no;
+  unsigned int padding0[8];
 
   union {
     struct {
+      int opc;
+      int dpc;
+      short slc;
+      short slinkix;
       struct link* slink;
       struct link* link;
-      int slinkix;
     } isup;
     struct {
+      int opc;
+      int dpc;
+      short slc;
+      short slinkix;
       struct link* slink;
-      int slinkix;
     } sccp;
 
     struct {
-      int ss7_protocol;
-      int host_ix;
+      short ss7_protocol;
+      short host_ix;
       union {
 	struct {
-	  int slinkix;
+	  short slinkix;
 	} isup;
       };
     } regist;
 
     struct {
       int level;
-      const char *file;
       int line;
+      const char *file;
       const char *function;
     } log;
 
     struct {
       int out;                  /* True if sent packet, false if received */
-      struct timeval stamp;        /* Timestamp */
       int sls;		/* Signalling link selector */
+      struct timeval stamp;        /* Timestamp */
     } dump;
 
     struct {
@@ -139,6 +159,9 @@ struct mtp_event {
       } link_state;
       struct link* link;
     } status;
+    struct {
+      unsigned char padding[40];
+    } padding;
   };
 
   int len;
@@ -155,3 +178,4 @@ void mtp3_reply(int s, const unsigned char* buff, unsigned int len, const struct
 int mtp3_register_isup(int s, int linkix);
 int mtp3_register_sccp(int s, int subsystem, int linkix);
 
+#pragma pack(pop)

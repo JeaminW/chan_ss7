@@ -1,9 +1,8 @@
 /* l4isup.h - ISUP protocol
  *
- * Copyright (C) 2006, Sifira A/S.
+ * Copyright (C) 2006-2011 Netfors ApS.
  *
- * Author: Anders Baekgaard <ab@sifira.dk>
- *         Anders Baekgaard <ab@netfors.com>
+ * Author: Anders Baekgaard <ab@netfors.com>
  * Based on work by: Kristian Nielsen <kn@sifira.dk>,
  *
  * This file is part of chan_ss7.
@@ -26,11 +25,11 @@
 
 int isup_init(void);
 int isup_cleanup(void);
-int cmd_block(int fd, int argc, char *argv[]);
-int cmd_unblock(int fd, int argc, char *argv[]);
-int cmd_linestat(int fd, int argc, char *argv[]);
-int cmd_reset(int fd, int argc, char *argv[]);
-int cmd_linkset_status(int fd, int argc, char *argv[]);
+int cmd_block(int fd, int argc, argv_type argv);
+int cmd_unblock(int fd, int argc, argv_type argv);
+int cmd_linestat(int fd, int argc, argv_type argv);
+int cmd_reset(int fd, int argc, argv_type argv);
+int cmd_linkset_status(int fd, int argc, argv_type argv);
 void l4isup_inservice(struct link* link);
 void l4isup_event(struct mtp_event* event);
 void l4isup_link_status_change(struct link* link, int up);
