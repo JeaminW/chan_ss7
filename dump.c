@@ -31,6 +31,22 @@
 #include <sys/poll.h>
 #include <netinet/in.h>
 
+#include "astversion.h"
+#include "config.h"
+#include "mtp3io.h"
+#include "mtp.h"
+#include "dump.h"
+
+
+#ifdef MTP_STANDALONE
+#include "aststubs.h"
+#undef pthread_mutex_destroy
+#undef pthread_mutex_lock
+#undef pthread_mutex_unlock
+#define ast_mutex_destroy pthread_mutex_destroy
+#define ast_mutex_lock pthread_mutex_lock
+#define ast_mutex_unlock pthread_mutex_unlock
+#else
 #include "asterisk.h"
 #include "asterisk/channel.h"
 #include "asterisk/module.h"
@@ -40,13 +56,7 @@
 #include "asterisk/sched.h"
 #include "asterisk/cli.h"
 #include "asterisk/lock.h"
-
-#include "astversion.h"
-#include "config.h"
-#include "mtp3io.h"
-#include "mtp.h"
-#include "dump.h"
-
+#endif
 
 /* State for dumps. */
 AST_MUTEX_DEFINE_STATIC(dump_mutex);
@@ -68,6 +78,8 @@ static void dump_pcap(FILE *f, struct mtp_event *event)
   res = fwrite(&event->len, sizeof(event->len), 1, f); /* number of bytes of packet in file */
   res = fwrite(&event->len, sizeof(event->len), 1, f); /* actual length of packet */
   res = fwrite(event->buf, 1, event->len, f);
+  if (res <= 0)
+    ast_log(LOG_WARNING, "Unable to write on pcap file, res: %d, error: %s\n", res, strerror(errno));
   fflush(f);
 }
 
@@ -125,6 +137,8 @@ static void init_pcap_file(FILE *f)
   res = fwrite(&sigfigs, sizeof(sigfigs), 1, f);
   res = fwrite(&snaplen, sizeof(snaplen), 1, f);
   res = fwrite(&linktype, sizeof(linktype), 1, f);
+  if (res <= 0)
+    ast_log(LOG_WARNING, "Unable to write on pcap file, res: %d, error: %s\n", res, strerror(errno));
 }
 
 
@@ -137,7 +151,7 @@ int init_dump(int fd, const char* fn, int in, int out, int fisu, int lssu, int m
     ast_cli(fd, "Dump already running, must be stopped (with 'ss7 stop dump') "
             "before new can be started.\n");
     ast_mutex_unlock(&dump_mutex);
-    return RESULT_FAILURE;
+    return -1;
   }
 
 
@@ -145,7 +159,7 @@ int init_dump(int fd, const char* fn, int in, int out, int fisu, int lssu, int m
   if(fh == NULL) {
     ast_cli(fd, "Error opening file '%s': %s.\n", fn, strerror(errno));
     ast_mutex_unlock(&dump_mutex);
-    return RESULT_FAILURE;
+    return -1;
   }
 
   if(in) {
